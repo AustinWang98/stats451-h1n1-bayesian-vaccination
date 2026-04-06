@@ -11,7 +11,8 @@ Course project for **STATS 451** (University of Michigan): binary prediction of 
 | `final-project-report.Rmd` | Written report (PDF via R Markdown / LaTeX sections). |
 | `model-specification.Rmd` | Short math write-up of likelihood, priors, and posterior structure. |
 | `analysis-early-draft.Rmd` | Earlier analysis draft (same general workflow as `analysis.Rmd`). |
-| `figures/` | Static figures referenced by the formal report (see below). |
+| `figures/` | Report figures (`01.png`, `02.png`, `03.jpg`) plus `posterior-distribution.png`. |
+| `deliverables/` | Exported PDFs, slides, and related documents from the course milestone. |
 | `archive/` | Alternate report draft with machine-specific figure paths (not maintained for reproducibility). |
 
 ## Requirements
@@ -29,13 +30,7 @@ Course project for **STATS 451** (University of Michigan): binary prediction of 
 
 ### Formal report figures
 
-`final-project-report.Rmd` expects these files (not committed here—add your own exports or regenerate):
-
-- `figures/01.png`
-- `figures/02.png`
-- `figures/03.jpg`
-
-Generate compatible plots from the EDA sections in `analysis.Rmd`, export with those names, then knit `final-project-report.Rmd` to PDF.
+`final-project-report.Rmd` knits figures from `figures/01.png`, `figures/02.png`, and `figures/03.jpg` (included in this repository). To refresh them, regenerate plots from the EDA sections in `analysis.Rmd` and overwrite those files.
 
 ## Methods (summary)
 
