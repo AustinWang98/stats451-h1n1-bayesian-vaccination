@@ -1,52 +1,63 @@
-# H1N1 vaccination prediction (hierarchical Bayes)
+# H1N1 vaccination: hierarchical Bayesian logistic regression
 
-Course project for **STATS 451** (University of Michigan): binary prediction of H1N1 vaccine uptake using **lasso feature selection** and **hierarchical Bayesian logistic regression** fit with **RStan**. The analysis uses survey-style individual-level data with demographic, behavioral, and health-related predictors.
+STATS 451 (University of Michigan) project. The code models **binary H1N1 vaccine uptake** (`h1n1_vaccine`) from National H1N1 Flu Survey–style individual records: behaviors, doctor recommendations, health indicators, demographics, and geography.
 
-## Repository layout
+## Data handling (in code)
 
-| Path | Description |
-|------|-------------|
-| `data/h1n1_vaccine_prediction.csv` | Modeling dataset (one row per respondent; response `h1n1_vaccine`). |
-| `analysis.Rmd` | Main pipeline: imputation, encoding, EDA plots, glmnet lasso, Stan models, evaluation. |
-| `final-project-report.Rmd` | Written report (PDF via R Markdown / LaTeX sections). |
-| `model-specification.Rmd` | Short math write-up of likelihood, priors, and posterior structure. |
-| `analysis-early-draft.Rmd` | Earlier analysis draft (same general workflow as `analysis.Rmd`). |
-| `figures/` | Report figures (`01.png`, `02.png`, `03.jpg`) plus `posterior-distribution.png`. |
-| `deliverables/` | Exported PDFs, slides, and related documents from the course milestone. |
-| `archive/` | Alternate report draft with machine-specific figure paths (not maintained for reproducibility). |
+- Empty strings are treated as missing. **Numeric** columns get **median** imputation; listed **categorical** fields get **mode** imputation.
+- Ordinal categories (`income_level`, `age_bracket`, `qualification`, `census_msa`) are mapped to **ordered numeric** scores; other categorical columns are **dummy-coded as numeric factors** for glmnet/Stan matrices.
+- **70/30** train/test split with stratification on the outcome (`caret::createDataPartition`, fixed seed).
 
-## Requirements
+## Feature selection: two logistic lassos
 
-- **R** (recent 4.x recommended)
-- R packages used in the notebooks: `tidyverse`, `glmnet`, `rstan`, `bayesplot`, `gridExtra`, `caret`, `knitr`
+Lasso is used separately for each hierarchical specification so the **grouping variable is not in the penalized predictor matrix** (it only enters as the hierarchical intercept index).
 
-**RStan** needs a working C++ toolchain (see the [RStan getting started guide](https://mc-stan.org/users/interfaces/rstan)).
+1. **Qualification model:** predictors exclude `qualification` (and `unique_id`, response). `glmnet::cv.glmnet`, `family = "binomial"`, `alpha = 1`, **5-fold CV**, `type.measure = "auc"`, coefficients at **`lambda.min`**. Nonzero columns define `x` for the first Stan model.
+2. **Census MSA model:** same setup but the matrix excludes **`census_msa`** instead; a second feature set for the second Stan model.
 
-## How to run
+Dropped variables differ between the two models (see the formal report table); the code prints selected and removed names per run.
 
-1. Clone the repository and open the project folder as your working directory (in RStudio: *Session → Set Working Directory → To Source File Location* is **not** required if you knit from the project root with `.Rmd` files at the top level).
-2. Install missing packages when R prompts you, or install them manually before knitting.
-3. Knit `analysis.Rmd` to reproduce modeling, plots, and Stan fits (runtime depends on MCMC settings and hardware).
+## Stan models (RStan)
 
-### Formal report figures
+Both models are **Bernoulli logistic regression with random intercepts** and shared slopes:
 
-`final-project-report.Rmd` knits figures from `figures/01.png`, `figures/02.png`, and `figures/03.jpg` (included in this repository). To refresh them, regenerate plots from the EDA sections in `analysis.Rmd` and overwrite those files.
+\[
+y_i \sim \mathrm{Bernoulli}(\mathrm{logit}^{-1}(\alpha_{g[i]} + x_i^\top \beta)),
+\]
 
-## Methods (summary)
+where \(g[i]\) is either **education level** (`qualification`, \(J\) levels) or **MSA category** (`census_msa`, \(J\) levels).
 
-- Missing values: numeric median imputation; categorical mode imputation.
-- Train/test split: 70% / 30% (`caret::createDataPartition`).
-- Feature screening: logistic **lasso** with 5-fold CV, `lambda.min`, AUC as the criterion.
-- Hierarchical models: group-specific intercepts by **education (`qualification`)** or **MSA status (`census_msa`)**, with shared individual-level coefficients; compared in the report.
+**Group intercepts:** \(\alpha_j \sim \mathcal{N}(\mu_\alpha, \sigma_\alpha)\) for \(j = 1,\ldots,J\) (partial pooling).
 
-## Suggested GitHub repository name
+**Priors (same in both programs):**
 
-Use a short, searchable name such as:
+| Parameter | Prior |
+|-----------|--------|
+| \(\beta\) | \(\mathcal{N}(0, 1)\) |
+| \(\mu_\alpha\) | \(\mathcal{N}(0, 1)\) |
+| \(\sigma_\alpha\) | **Half-Cauchy** implied by `sigma_alpha ~ cauchy(0, 1.5)` with `lower=0` |
 
-**`stats451-h1n1-bayesian-vaccination`**
+**Sampling:** `sampling(..., iter = 2000, chains = 4, seed = 123)` for each model.
 
-(Alternatives: `umich-stats451-h1n1-hierarchical-bayes`, `h1n1-vaccine-hierarchical-bayes`.)
+**Generated quantities:** per-row **probability** `theta` and **pointwise log-likelihood** `log_lik` for **PSIS-LOO** (`loo` / `loo_compare`).
 
-## License
+## What the analysis does after fitting
 
-Add a `LICENSE` file if you want others to reuse the code; course projects often use MIT or remain “all rights reserved” unless your instructor specifies otherwise.
+- **`loo_compare`** on the two fits (qualification vs census MSA random intercepts).
+- **`bayesplot::mcmc_areas`** on posterior samples for \(\beta\), \(\alpha\), \(\mu_\alpha\), \(\sigma_\alpha\) (census MSA model), with a mapping from `beta[k]` to predictor names.
+- **Test-set prediction** using the **census MSA** fit: for each test row, linear predictors are built from posterior draws of \(\alpha\) and \(\beta\), then **posterior mean** inv-logit probabilities; **grouped means** by `census_msa` vs observed vaccination rates and a bar/point plot.
+
+## Files (what they hold)
+
+| File | Role |
+|------|------|
+| `analysis.Rmd` | Full pipeline: imputation, encoding, EDA plots, both lassos, both Stan strings, LOO, posterior plots, test predictions, grouped calibration plot. |
+| `final-project-report.Rmd` | Long-form writeup (LaTeX sections) with embedded figures under `figures/`. |
+| `model-specification.Rmd` | Compact math description of likelihood, priors, and posterior (variant priors on \(\beta\) / hyperparameters in that draft). |
+| `analysis-early-draft.Rmd` | Earlier end-to-end draft of the same style of workflow. |
+| `data/h1n1_vaccine_prediction.csv` | Row-level survey features and `h1n1_vaccine`. |
+| `figures/` | Static figures for the report; `posterior-distribution.png` from the posterior visualization workflow. |
+| `deliverables/` | Exported PDFs, slides, and documents from the course. |
+| `archive/` | Alternate report source with different local figure paths. |
+
+Core dependencies in the notebooks: **tidyverse**, **glmnet**, **rstan**, **loo**, **bayesplot**, **gridExtra**, **caret**, **knitr**.
