@@ -1,0 +1,19 @@
+# R / RStudio
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+*.Rout
+.Rproj.user/
+*.Rproj
+
+# Knitr / Pandoc outputs (optional: uncomment if you do not want PDFs in git)
+# *.pdf
+# *_files/
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*~

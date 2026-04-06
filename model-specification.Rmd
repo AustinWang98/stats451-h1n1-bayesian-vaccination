@@ -1,0 +1,57 @@
+---
+title: "final_latex"
+output: pdf_document
+date: "2024-12-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+\subsection*{1. Likelihood}
+The likelihood function for the binary outcome \(y_n \in \{0, 1\}\) is:
+\[
+y_n \sim \text{Bernoulli}(\theta_n),
+\]
+where
+\[
+\theta_n = \text{logit}^{-1}(\alpha_{\text{qualification}[n]} + \mathbf{x}_n \cdot \boldsymbol{\beta}),
+\]
+and \(\text{logit}^{-1}(z) = \frac{1}{1 + e^{-z}}\).
+
+\subsection*{2. Priors}
+The priors for the model parameters are:
+\[
+\alpha_j \sim \text{Normal}(\mu_\alpha, \sigma_\alpha), \quad j = 1, \dots, J,
+\]
+\[
+\beta_k \sim \text{Normal}(0, 3), \quad k = 1, \dots, K.
+\]
+
+\subsection*{3. Hyperpriors}
+The hyperpriors for the hierarchical parameters are:
+\[
+\mu_\alpha \sim \text{Normal}(0, 3),
+\]
+\[
+\sigma_\alpha \sim \text{Cauchy}(0, 2.5).
+\]
+
+\subsection*{4. Posterior Distribution}
+The posterior distribution for the parameters is proportional to:
+\[
+p(\boldsymbol{\alpha}, \boldsymbol{\beta}, \mu_\alpha, \sigma_\alpha \mid \mathbf{y}) \propto \prod_{n=1}^N \text{Bernoulli}(y_n \mid \theta_n) 
+\cdot \prod_{j=1}^J \text{Normal}(\alpha_j \mid \mu_\alpha, \sigma_\alpha)
+\cdot \prod_{k=1}^K \text{Normal}(\beta_k \mid 0, 3)
+\cdot \text{Normal}(\mu_\alpha \mid 0, 3)
+\cdot \text{Cauchy}(\sigma_\alpha \mid 0, 2.5).
+\]
+
+\subsection*{5. Log-Likelihood}
+The log-likelihood for each observation is:
+\[
+\text{log-likelihood}_n = y_n \cdot \log(\theta_n) + (1 - y_n) \cdot \log(1 - \theta_n),
+\]
+where \(\theta_n = \text{logit}^{-1}(\alpha_{\text{qualification}[n]} + \mathbf{x}_n \cdot \boldsymbol{\beta})\).
+
+\end{document}

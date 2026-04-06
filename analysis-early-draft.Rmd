@@ -1,0 +1,309 @@
+---
+title: "Final_project"
+output: pdf_document
+date: "2024-11-17"
+---
+
+## Exploratory Data Analysis  
+
+```{r, warning=FALSE}
+library(tidyverse)
+library(glmnet) 
+library(rstan) 
+library(bayesplot)
+library(gridExtra)
+library(caret)
+
+
+data <- read.csv("data/h1n1_vaccine_prediction.csv")
+data[data == ""] <- NA
+categorical_vars <- c("age_bracket", "qualification", "race", "sex", 
+                      "income_level", "marital_status", "housing_status", 
+                      "employment", "census_msa")
+summary(data)
+mode_func <- function(x) {
+  uniq_x <- unique(x)
+  uniq_x[which.max(tabulate(match(x, uniq_x)))]
+}
+data_imputed <- data %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .))) %>%
+  mutate(across(all_of(categorical_vars), ~ ifelse(is.na(.), mode_func(.), .)))
+data_encoded <- data_imputed %>%
+  mutate(
+    income_level = as.numeric(factor(income_level, 
+                                     levels = c("Below Poverty", "<= $75,000, Above Poverty", "> $75,000"), 
+                                     ordered = TRUE)),
+    age_bracket = as.numeric(factor(age_bracket, 
+                                    levels = c("18 - 34 Years", "35 - 44 Years", "45 - 54 Years", "55 - 64 Years", "65+ Years"), 
+                                    ordered = TRUE)),
+    qualification = as.numeric(factor(qualification, 
+                                      levels = c("< 12 Years", "12 Years", "Some College", "College Graduate"), 
+                                      ordered = TRUE)),
+    census_msa = as.numeric(factor(census_msa, 
+                                   levels = c("Non-MSA", "MSA, Not Principle  City", "MSA, Principle City"), 
+                                   ordered = TRUE)),
+    across(setdiff(categorical_vars, c("income_level", "age_bracket", "qualification", "census_msa")), 
+           ~ as.numeric(as.factor(.)))
+  )
+
+set.seed(123)
+train_index <- createDataPartition(data_encoded$h1n1_vaccine, p = 0.7, list = FALSE)
+train_data <- data_encoded[train_index, ]
+test_data <- data_encoded[-train_index, ]
+
+```
+
+
+```{r}
+important_vars <- c("h1n1_vaccine", "census_msa", "income_level", "race", "qualification")
+data_imputed$income_level <- factor(data_imputed$income_level,levels = unique(data_imputed$income_level), labels = c("Poverty", "Mid Income", "High Income"))
+data_imputed$census_msa <- factor(data_imputed$census_msa,levels = unique(data_imputed$census_msa), labels = c("MSA, non-p city", "MSA, p city", "Non-MSA"))
+plots <- lapply(important_vars, function(var) {
+  ggplot(data_imputed, aes_string(x = var)) +
+    geom_bar(fill = "skyblue", color = "black") +
+    labs(title = paste(var), x = var, y = "Count") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+          plot.title = element_text(size = 14, face = "bold"))
+})
+grid.arrange(grobs = plots, ncol = 3, nrow = 2)
+
+```
+
+```{r}
+exploratory_vars <- c("census_msa", "income_level", "race", "qualification")
+plots <- lapply(exploratory_vars, function(var) {
+  data_encoded %>%
+    group_by(.data[[var]]) %>%
+    summarize(mean_vaccine = mean(h1n1_vaccine, na.rm = TRUE)) %>%
+    ggplot(aes(x = .data[[var]], y = mean_vaccine)) +
+    geom_point(size = 3) +
+    geom_line(group = 1) +
+    labs(
+      x = var,
+      y = "Proportion Vaccinated"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(size = 14, face = "bold")
+    )
+})
+
+grid.arrange(grobs = plots, ncol = 2, nrow = 2)
+```
+
+The plots show how census_msa, income_level, race, and qualification influence H1N1 vaccination rates. Qualification displays the most linear and significant trend, with vaccination rates steadily increasing across education levels, suggesting a strong relationship between education and vaccine uptake. In contrast, income_level also shows an upward trend, while race and census_msa exhibit more moderate or non-linear patterns. The clear differences between education levels make qualification an ideal candidate for assigning distinct alphas in a Bayesian hierarchical structure.
+
+```{r}
+x_train <- as.matrix(train_data %>% select(-h1n1_vaccine, -unique_id, -qualification))
+x_test <- as.matrix(test_data %>% select(-h1n1_vaccine, -unique_id, -qualification))
+y_train <- train_data$h1n1_vaccine
+
+feature_scores <- apply(x_train, 2, function(col) {
+  test <- glm(y_train ~ col, family = "binomial") 
+  summary(test)$coefficients[2, 4]         
+})
+
+selected_features <- which(feature_scores < 0.05)
+x_selected <- x_train[, selected_features]
+
+x_test_selected <- x_test[, selected_features]
+selected_variable_names <- colnames(x_train)[selected_features]
+print(selected_variable_names)
+
+original_vars <- colnames(x_train)
+removed_features <- setdiff(original_vars, selected_variable_names)
+print(removed_features)
+
+```
+
+The lasso regression uses L1 penalty that forces some coefficients to become exactly zero, so effectively excluding those variables from the model. "wash_hands_frequently" is eliminated variables because they likely showed weak or no significant correlation with the likelihood of receiving the H1N1 vaccine compared to other variables.
+
+```{r}
+stan_data <- list(
+  N = nrow(train_data),
+  J = length(unique(train_data$qualification)),
+  K = ncol(x_selected),
+  y = y_train,
+  x = x_selected,
+  qualification = as.numeric(as.factor(train_data$qualification))
+)
+
+stan_model_code_vec <- "
+data {
+  int<lower=0> N;
+  int<lower=0> J;
+  int<lower=0> K;
+  int<lower=0,upper=1> y[N];
+  matrix[N, K] x;
+  int<lower=1,upper=J> qualification[N];
+}
+parameters {
+  vector[K] beta;
+  vector[J] alpha;
+  real mu_alpha;
+  real<lower=0> sigma_alpha;
+}
+model {
+  // Priors
+  alpha ~ normal(mu_alpha, sigma_alpha);
+  beta ~ normal(0, 3);
+  mu_alpha ~ normal(0, 3);
+  sigma_alpha ~ cauchy(0, 2.5);
+  
+  // Vectorized likelihood
+  y ~ bernoulli_logit(alpha[qualification] + x * beta);
+}
+generated quantities {
+  vector[N] theta;
+  vector[N] log_lik;
+  for (n in 1:N) {
+    theta[n] = inv_logit(alpha[qualification[n]] + x[n] * beta);
+    log_lik[n] = bernoulli_lpmf(y[n] | theta[n]); 
+  }
+}
+"
+
+stan_model_vec <- stan_model(model_code = stan_model_code_vec)
+fit_final <- sampling(stan_model_vec, data = stan_data, iter = 2000, chains = 4, seed = 123, cores = 4)
+```
+
+```{r}
+print(fit_final, pars = c("beta", "alpha", "mu_alpha", "sigma_alpha"))
+```
+
+```{r}
+x_train_2 <- as.matrix(train_data %>% select(-h1n1_vaccine, -unique_id, -census_msa))
+x_test_2 <- as.matrix(test_data %>% select(-h1n1_vaccine, -unique_id, -census_msa))
+feature_scores <- apply(x_train_2, 2, function(col) {
+  test <- glm(y_train ~ col, family = "binomial") 
+  summary(test)$coefficients[2, 4]         
+})
+
+selected_features_2 <- which(feature_scores < 0.05)
+x_selected_2 <- x_train_2[, selected_features_2]
+x_test_selected_2 <-x_test_2[, selected_features_2]
+selected_variable_names_2 <- colnames(x_train_2)[selected_features_2]
+print(selected_variable_names_2)
+
+original_vars_2 <- colnames(x_train_2)
+removed_features_2 <- setdiff(original_vars_2, selected_variable_names_2)
+print(removed_features_2)
+```
+
+```{r}
+stan_data_2 <- list(
+  N = nrow(train_data),
+  J = length(unique(train_data$census_msa)),
+  K = ncol(x_selected_2),
+  y = y_train,
+  x = x_selected_2,
+  census = as.numeric(as.factor(train_data$census_msa))
+)
+
+stan_model_code_vec_2 <- "
+data {
+  int<lower=0> N;
+  int<lower=0> J;
+  int<lower=0> K;
+  int<lower=0,upper=1> y[N];
+  matrix[N, K] x;
+  int<lower=1,upper=J> census[N];
+}
+parameters {
+  vector[K] beta;
+  vector[J] alpha;
+  real mu_alpha;
+  real<lower=0> sigma_alpha;
+}
+model {
+  // Priors
+  alpha ~ normal(mu_alpha, sigma_alpha);
+  beta ~ normal(0, 3);
+  mu_alpha ~ normal(0, 3);
+  sigma_alpha ~ cauchy(0, 1.5);
+  
+  // Vectorized likelihood
+  y ~ bernoulli_logit(alpha[census] + x * beta);
+}
+generated quantities {
+  vector[N] theta;
+  vector[N] log_lik;
+  for (n in 1:N) {
+    theta[n] = inv_logit(alpha[census[n]] + x[n] * beta);
+    log_lik[n] = bernoulli_lpmf(y[n] | theta[n]); 
+  }
+}
+"
+
+stan_model_vec_2 <- stan_model(model_code = stan_model_code_vec_2)
+fit_final_2 <- sampling(stan_model_vec_2, data = stan_data_2, iter = 3000, chains = 4, seed = 123, cores = 4)
+```
+
+```{r}
+library("loo")
+log_lik_qualification <- extract_log_lik(fit_final, parameter_name = "log_lik")
+log_lik_census <- extract_log_lik(fit_final_2, parameter_name = "log_lik")
+loo_qualification <- loo(log_lik_qualification)
+loo_census <- loo(log_lik_census)
+comparison <- loo_compare(loo_qualification, loo_census)
+print(comparison)
+```
+
+```{r}
+# Prepare Stan-compatible test data
+posterior_alpha <- extract(fit_final_2, pars = "alpha")$alpha  # Group-level intercepts
+posterior_beta <- extract(fit_final_2, pars = "beta")$beta
+stan_data_test <- list(
+  N = nrow(test_data),  # Number of test observations
+  J = length(unique(train_data$census)),  # Number of census groups (from training data)
+  K = ncol(x_test_selected_2),  # Number of predictors
+  x = x_test_selected_2,  # Test feature matrix
+  census = as.numeric(as.factor(test_data$census_msa))  # Census group IDs
+)
+
+# Compute linear predictors for all test observations
+linear_predictors <- sapply(1:nrow(x_test_selected_2), function(n) {
+  posterior_alpha[, stan_data_test$census[n]] + 
+    as.numeric(matrix(x_test_selected_2[n, ], nrow = 1) %*% t(posterior_beta))
+})
+
+predicted_probabilities <- colMeans(1 / (1 + exp(-linear_predictors)))
+test_data$predicted_probabilities <- predicted_probabilities
+
+
+```
+
+```{r}
+library(pROC)
+
+# Compute AUC
+auc <- roc(test_data$h1n1_vaccine, test_data$predicted_probabilities)$auc
+cat("AUC:", auc, "\n")
+
+```
+
+
+
+
+```{r}
+theta_samples <- extract(fit_final)$theta  # Extract samples for theta
+
+colnames(theta_samples) <- paste0("theta[", 1:ncol(theta_samples), "]")
+
+theta_summary <- apply(theta_samples, 2, function(x) {
+  c(mean = mean(x), 
+    median = median(x), 
+    lower_95 = quantile(x, 0.025), 
+    upper_95 = quantile(x, 0.975))
+})
+
+theta_summary_df <- as.data.frame(t(theta_summary))
+
+# Visualize first 5 theta parameters with mcmc_areas
+mcmc_areas(as.matrix(theta_samples[, 1:5]),
+           pars = colnames(theta_samples)[1:5],
+           prob = 0.95)
+
+```

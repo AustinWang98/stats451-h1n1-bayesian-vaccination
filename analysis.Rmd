@@ -1,0 +1,358 @@
+---
+title: "Final_project_code"
+output: pdf_document
+date: "2024-12-10"
+---
+
+# Data Cleaning and Exploratory Data Analysis  
+
+```{r, warning=FALSE}
+library(tidyverse)
+library(glmnet) 
+library(rstan) 
+library(bayesplot)
+library(gridExtra)
+library(caret)
+
+
+data <- read.csv("data/h1n1_vaccine_prediction.csv")
+data[data == ""] <- NA
+categorical_vars <- c("age_bracket", "qualification", "race", "sex", "income_level", "marital_status", "housing_status", "employment", "census_msa")
+summary(data)
+
+mode_func <- function(x) {
+  uniq_x <- unique(x)
+  uniq_x[which.max(tabulate(match(x, uniq_x)))]
+}
+
+data_imputed <- data %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .))) %>%
+  mutate(across(all_of(categorical_vars), ~ ifelse(is.na(.), mode_func(.), .)))
+
+
+data_encoded <- data_imputed %>%
+  mutate(
+    income_level = as.numeric(factor(income_level, 
+                                     levels = c("Below Poverty", "<= $75,000, Above Poverty", "> $75,000"), 
+                                     ordered = TRUE)),
+    age_bracket = as.numeric(factor(age_bracket, 
+                                    levels = c("18 - 34 Years", "35 - 44 Years", "45 - 54 Years", "55 - 64 Years", "65+ Years"), 
+                                    ordered = TRUE)),
+    qualification = as.numeric(factor(qualification, 
+                                      levels = c("< 12 Years", "12 Years", "Some College", "College Graduate"), 
+                                      ordered = TRUE)),
+    census_msa = as.numeric(factor(census_msa, 
+                                   levels = c("Non-MSA", "MSA, Not Principle  City", "MSA, Principle City"), 
+                                   ordered = TRUE)),
+    across(setdiff(categorical_vars, c("income_level", "age_bracket", "qualification", "census_msa")), 
+           ~ as.numeric(as.factor(.)))
+  )
+
+set.seed(123)
+train_index <- createDataPartition(data_encoded$h1n1_vaccine, p = 0.7, list = FALSE)
+train_data <- data_encoded[train_index, ]
+test_data <- data_encoded[-train_index, ]
+```
+
+
+```{r}
+important_vars <- c("h1n1_vaccine", "census_msa", "income_level", "race", "qualification")
+data_imputed$income_level <- factor(data_imputed$income_level,levels = unique(data_imputed$income_level), labels = c("Poverty", "Mid Income", "High Income"))
+data_imputed$census_msa <- factor(data_imputed$census_msa,levels = unique(data_imputed$census_msa), labels = c("MSA, non-p city", "MSA, p city", "Non-MSA"))
+data_imputed$qualification <- factor(data_imputed$qualification,levels = unique(data_imputed$qualification), labels = c("< 12 Years", "12 Years", "Some College", "College Graduate"))
+plots <- lapply(important_vars, function(var) {
+  ggplot(data_imputed, aes_string(x = var)) +
+    geom_bar(fill = "skyblue", color = "black") +
+    labs(title = paste(var), x = var, y = "Count") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+          plot.title = element_text(size = 14, face = "bold"))
+})
+grid.arrange(grobs = plots, ncol = 3, nrow = 2)
+```
+
+```{r}
+exploratory_vars <- c("census_msa", "income_level", "race", "qualification")
+plots <- lapply(exploratory_vars, function(var) {
+  data_encoded %>%
+    group_by(.data[[var]]) %>%
+    summarize(mean_vaccine = mean(h1n1_vaccine, na.rm = TRUE)) %>%
+    ggplot(aes(x = .data[[var]], y = mean_vaccine)) +
+    geom_point(size = 3) +
+    geom_line(group = 1) +
+    labs(x = var,y = "Proportion Vaccinated") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(size = 14, face = "bold")
+    )
+})
+
+grid.arrange(grobs = plots, ncol = 2, nrow = 2)
+```
+
+The plots show how census_msa, income_level, race(unranked), and qualification influence H1N1 vaccination rates. Qualification displays the most linear and significant trend, with vaccination rates increasing across education levels. Income_level also shows an upward trend, while census_msa exhibit more moderate or non-linear patterns. The clear differences between education levels make qualification an ideal candidate for assigning distinct alphas in a Bayesian hierarchical structure.
+
+# Feature selection
+
+```{r}
+library(glmnet)
+
+x_train <- as.matrix(train_data %>% select(-h1n1_vaccine, -unique_id, -qualification))
+x_test <- as.matrix(test_data %>% select(-h1n1_vaccine, -unique_id, -qualification))
+y_train <- train_data$h1n1_vaccine
+
+lasso_model <- cv.glmnet(
+  x_train, y_train, 
+  alpha = 1,                    
+  family = "binomial",         
+  type.measure = "auc",         
+  nfolds = 5
+)
+
+selected_coefficients <- as.matrix(coef(lasso_model, s = "lambda.min"))
+selected_features <- rownames(selected_coefficients)[selected_coefficients[, 1] != 0][-1] 
+print("Selected Features:")
+print(selected_features)
+
+x_selected <- x_train[, selected_features]
+x_test_selected <- x_test[, selected_features]
+
+selected_variable_names <- selected_features
+original_vars <- colnames(x_train)
+removed_features <- setdiff(original_vars, selected_variable_names)
+print("Removed Features:")
+print(removed_features)
+```
+# RStan Model (Qualification)
+
+```{r}
+stan_data <- list(
+  N = nrow(train_data),
+  J = length(unique(train_data$qualification)),
+  K = ncol(x_selected),
+  y = y_train,
+  x = x_selected,
+  qualification = as.numeric(as.factor(train_data$qualification))
+)
+
+stan_model_qualification <- "
+data {
+  int<lower=0> N;   // Total number of rows in the dataset
+  int<lower=0> J;   // Number of unique levels in the qualification variable
+  int<lower=0> K;   // Number of selected predictors
+  int<lower=0,upper=1> y[N];   // Target variable (whether vaccinated or not)
+  matrix[N, K] x;   // Selected predictors for each individual
+  int<lower=1,upper=J> qualification[N];   // Encoded education levels for each individual
+}
+
+parameters {
+  vector[K] beta;   // Coefficients for predictors
+  vector[J] alpha;   // Separate intercept for each education level
+  real mu_alpha;    // Hyperparameter for the intercepts: Mean of the group-level intercepts
+  real<lower=0> sigma_alpha;   // Also Hyperparameter for the intercepts: Standard deviation of group-level intercepts
+}
+
+model {
+  alpha ~ normal(mu_alpha, sigma_alpha);   // Group-level Intercepts that follow a normal distribution
+  beta ~ normal(0, 1);   // Informative normal prior for predictors
+  mu_alpha ~ normal(0, 1);   // Prior for mean intercepts
+  sigma_alpha ~ cauchy(0, 1.5);   // Prior for standard deviation of intercepts
+  y ~ bernoulli_logit(alpha[qualification] + x * beta);   // Binary outcome y with the logistic regression
+}
+
+generated quantities {
+  vector[N] theta;   // Predicted probabilities
+  vector[N] log_lik;   // Log-likelihood for each observation
+  for (n in 1:N) {
+    theta[n] = inv_logit(alpha[qualification[n]] + x[n] * beta);
+    log_lik[n] = bernoulli_lpmf(y[n] | theta[n]); 
+  }
+}
+"
+
+stan_model_qualification <- stan_model(model_code = stan_model_qualification)
+fit_final <- sampling(stan_model_qualification, data = stan_data, iter = 2000, chains = 4, seed = 123, cores = 4)
+```
+
+```{r}
+print(fit_final, pars = c("beta", "alpha", "mu_alpha", "sigma_alpha"))
+```
+
+# Feature selection & stan model for census_msa
+
+```{r}
+x_train_2 <- as.matrix(train_data %>% select(-h1n1_vaccine, -unique_id, -census_msa))
+x_test_2 <- as.matrix(test_data %>% select(-h1n1_vaccine, -unique_id, -census_msa))
+
+lasso_model_2 <- cv.glmnet(
+  x_train_2, y_train, 
+  alpha = 1,                   
+  family = "binomial",          
+  type.measure = "auc",         
+  nfolds = 5                  
+)
+
+selected_coefficients_2 <- as.matrix(coef(lasso_model_2, s = "lambda.min"))
+selected_features_2 <- rownames(selected_coefficients_2)[selected_coefficients_2[, 1] != 0][-1] 
+print("Selected Features:")
+print(selected_features_2)
+
+x_selected_2 <- x_train_2[, selected_features_2]
+x_test_selected_2 <- x_test_2[, selected_features_2]
+
+original_vars_2 <- colnames(x_train_2)
+removed_features_2 <- setdiff(original_vars_2, selected_features_2)
+print("Removed Features:")
+print(removed_features_2)
+```
+
+```{r}
+stan_data_2 <- list(
+  N = nrow(train_data),
+  J = length(unique(train_data$census_msa)),
+  K = ncol(x_selected_2),
+  y = y_train,
+  x = x_selected_2,
+  census = as.numeric(as.factor(train_data$census_msa))
+)
+
+stan_model_census <- "
+data {
+  int<lower=0> N;
+  int<lower=0> J;
+  int<lower=0> K;
+  int<lower=0,upper=1> y[N];
+  matrix[N, K] x;
+  int<lower=1,upper=J> census[N];   // census_msa categories
+}
+
+parameters {
+  vector[K] beta;
+  vector[J] alpha;   // Group-level intercepts for census_msa
+  real mu_alpha;
+  real<lower=0> sigma_alpha;
+}
+
+model {
+  alpha ~ normal(mu_alpha, sigma_alpha);
+  beta ~ normal(0, 1);
+  mu_alpha ~ normal(0, 1);
+  sigma_alpha ~ cauchy(0, 1.5);
+  
+  y ~ bernoulli_logit(alpha[census] + x * beta);
+}
+
+generated quantities {
+  vector[N] theta;
+  vector[N] log_lik;
+  for (n in 1:N) {
+    theta[n] = inv_logit(alpha[census[n]] + x[n] * beta);
+    log_lik[n] = bernoulli_lpmf(y[n] | theta[n]); 
+  }
+}
+"
+
+stan_model_census <- stan_model(model_code = stan_model_census)
+fit_final_2 <- sampling(stan_model_census, data = stan_data_2, iter = 2000, chains = 4, seed = 123, cores = 4)
+```
+
+```{r}
+print(fit_final_2, pars = c("beta", "alpha", "mu_alpha", "sigma_alpha"))
+```
+
+# Use of loo package for comparison of the two stan models
+
+```{r}
+library("loo")
+log_lik_qualification <- extract_log_lik(fit_final, parameter_name = "log_lik")
+loo_qualification <- loo(log_lik_qualification)
+log_lik_census <- extract_log_lik(fit_final_2, parameter_name = "log_lik")
+loo_census <- loo(log_lik_census)
+comparison <- loo_compare(loo_qualification, loo_census)
+print(comparison)
+```
+
+# Posterior distribution
+
+```{r}
+library(bayesplot)
+
+posterior_samples <- extract(fit_final_2)
+all_samples <- cbind(
+  as.matrix(posterior_samples$beta),       
+  as.matrix(posterior_samples$alpha),      
+  posterior_samples$mu_alpha,              
+  posterior_samples$sigma_alpha            
+)
+colnames(all_samples) <- c(
+  paste0("beta[", 1:ncol(posterior_samples$beta), "]"),
+  paste0("alpha[", 1:ncol(posterior_samples$alpha), "]"),
+  "mu_alpha", 
+  "sigma_alpha"
+)
+
+mcmc_areas(
+  as.matrix(all_samples),       
+  pars = colnames(all_samples),   
+  prob = 0.95                    
+)
+
+```
+
+```{r}
+selected_feature_names <- colnames(x_selected_2)
+beta_mapping <- data.frame(
+  Beta = paste0("beta[", seq_along(selected_feature_names), "]"),  
+  Predictor = selected_feature_names                            
+)
+
+beta_mapping
+```
+
+
+# Make predictions on test data using the posterior samples from the model of census_msa
+
+```{r}
+posterior_alpha <- extract(fit_final_2, pars = "alpha")$alpha
+posterior_beta <- extract(fit_final_2, pars = "beta")$beta
+
+stan_data_test <- list(
+  N = nrow(test_data),   # Total number of test observations
+  J = length(unique(train_data$census)),   # Number of unique census groups in the training data
+  K = ncol(x_test_selected_2),   # Number of predictors included in the test matrix
+  x = x_test_selected_2,   # The matrix of selected predictors for the test data
+  census = as.numeric(as.factor(test_data$census_msa))   # Encoded group IDs for the census_msa variable in the test data
+)
+
+# Compute the posterior linear predictor for each test observation
+linear_predictors <- sapply(1:nrow(x_test_selected_2), function(n) {
+  posterior_alpha[, stan_data_test$census[n]] + 
+    as.numeric(matrix(x_test_selected_2[n, ], nrow = 1) %*% t(posterior_beta))
+})
+
+# Convert the linear predictors into probabilities using the sigmoid function
+predicted_probabilities <- colMeans(1 / (1 + exp(-linear_predictors)))
+test_data$predicted_probabilities <- predicted_probabilities
+```
+
+
+# Grouped prediction analysis
+
+```{r}
+grouped_predictions <- test_data %>% group_by(census_msa) %>%
+  summarize(
+    mean_predicted = mean(predicted_probabilities),
+    mean_observed = mean(h1n1_vaccine)
+  )
+
+print(grouped_predictions)
+
+ggplot(grouped_predictions, aes(x = census_msa, y = mean_predicted)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  geom_point(aes(y = mean_observed), color = "red", size = 3) +
+  labs(title = "Predicted vs Observed Vaccination Rates by Census MSA",
+       x = "Census MSA",
+       y = "Probability") +
+  theme_minimal()
+```
